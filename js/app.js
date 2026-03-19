@@ -157,35 +157,46 @@ document.getElementById('btnDoUnlock').addEventListener('click', async () => {
   hideError('unlockError');
 
   const arrayBuffer = await readFileAsArrayBuffer(currentFile);
-  showLoading('Unlocking PDF...', 0);
+  showLoading('Verifying password...', 10);
 
   try {
-    // Load with password — pdf-lib will throw if wrong password
-    const pdfDoc = await PDFLib.PDFDocument.load(arrayBuffer, {
-      password,
-      ignoreEncryption: false,
-    });
+    // Step 1 — use PDF.js to open the PDF (supports RC4, AES-128, AES-256)
+    let pdfJs;
+    try {
+      pdfJs = await pdfjsLib.getDocument({
+        data: new Uint8Array(arrayBuffer.slice(0)),
+        password,
+      }).promise;
+    } catch (e) {
+      hideLoading();
+      // PDF.js throws PasswordException for wrong / missing password
+      const isWrongPw = e.name === 'PasswordException' ||
+        (e.message || '').toLowerCase().includes('password');
+      showError('unlockError', isWrongPw
+        ? 'Incorrect password. Please try again.'
+        : `Could not open PDF: ${e.message}`);
+      return;
+    }
 
-    setProgress(60, 'Removing encryption...');
-    await sleep(50); // yield to UI
+    setProgress(30, 'Password verified — rebuilding PDF...');
 
-    // Save without encryption
-    const bytes = await pdfDoc.save({ useObjectStreams: false });
+    // Step 2 — render all pages to canvas via PDF.js, then pack into a new
+    // pdf-lib document.  This approach works for every encryption type because
+    // we never ask pdf-lib to decrypt; we give it already-rendered pixels.
+    const bytes = await renderPagesToNewPDF(pdfJs, 2.0, 0.94);
+
     setProgress(100, 'Done!');
     await sleep(100);
 
     const baseName = stripExtension(currentFile.name);
-    finishWithBlob(new Blob([bytes], { type: 'application/pdf' }),
+    finishWithBlob(
+      new Blob([bytes], { type: 'application/pdf' }),
       `${baseName}_unlocked.pdf`,
-      'PDF unlocked successfully. Encryption has been removed.');
+      'PDF unlocked — downloaded without password protection.'
+    );
   } catch (err) {
     hideLoading();
-    const msg = err.message || '';
-    if (msg.includes('password') || msg.includes('encrypted') || msg.includes('incorrect')) {
-      showError('unlockError', 'Incorrect password. Please try again.');
-    } else {
-      showError('unlockError', `Failed to unlock PDF: ${msg}`);
-    }
+    showError('unlockError', `Failed to unlock: ${err.message}`);
   }
 });
 
@@ -218,8 +229,41 @@ document.getElementById('btnDoShrink').addEventListener('click', async () => {
   }
 });
 
+// ── Shared renderer: PDF.js → canvas → pdf-lib ───────────────────────────────
+// pdfJs   : already-loaded pdfjsLib document
+// scale   : render scale (1.0 = 72 dpi, 2.0 = 144 dpi)
+// jpegQ   : JPEG quality 0..1
+async function renderPagesToNewPDF(pdfJs, scale, jpegQ) {
+  const numPages = pdfJs.numPages;
+  const newDoc   = await PDFLib.PDFDocument.create();
+
+  for (let i = 1; i <= numPages; i++) {
+    setProgress(Math.round(10 + (i / numPages) * 80), `Page ${i} of ${numPages}...`);
+    await sleep(0); // yield to browser so spinner stays responsive
+
+    const page   = await pdfJs.getPage(i);
+    const vp     = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width  = Math.round(vp.width);
+    canvas.height = Math.round(vp.height);
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+
+    const dataUrl  = canvas.toDataURL('image/jpeg', jpegQ);
+    const imgBytes = Uint8Array.from(atob(dataUrl.split(',')[1]), c => c.charCodeAt(0));
+    const jpg      = await newDoc.embedJpg(imgBytes);
+
+    // Add page at the original (1×) dimensions so physical size is preserved
+    const vp1  = page.getViewport({ scale: 1.0 });
+    const np   = newDoc.addPage([vp1.width, vp1.height]);
+    np.drawImage(jpg, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+  }
+
+  setProgress(95, 'Saving...');
+  await sleep(30);
+  return newDoc.save({ useObjectStreams: true });
+}
+
 async function compressPDF(arrayBuffer, quality) {
-  // Quality → DPI + JPEG quality mapping
   const qualityMap = {
     low:    { scale: 0.8,  jpegQ: 0.35 },
     medium: { scale: 1.0,  jpegQ: 0.65 },
@@ -227,39 +271,8 @@ async function compressPDF(arrayBuffer, quality) {
   };
   const { scale, jpegQ } = qualityMap[quality];
 
-  // Load with PDF.js to render pages
-  const pdfJs = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
-  const numPages = pdfJs.numPages;
-
-  // Create new pdf-lib document
-  const newDoc = await PDFLib.PDFDocument.create();
-
-  for (let i = 1; i <= numPages; i++) {
-    setProgress(Math.round((i / numPages) * 85), `Compressing page ${i} of ${numPages}...`);
-    await sleep(0);
-
-    const page  = await pdfJs.getPage(i);
-    const vp    = page.getViewport({ scale });
-    const canvas = document.createElement('canvas');
-    canvas.width  = Math.round(vp.width);
-    canvas.height = Math.round(vp.height);
-    const ctx = canvas.getContext('2d');
-
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
-
-    // Get JPEG data URL
-    const dataUrl  = canvas.toDataURL('image/jpeg', jpegQ);
-    const base64   = dataUrl.split(',')[1];
-    const imgBytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-
-    const jpgImage = await newDoc.embedJpg(imgBytes);
-    const newPage  = newDoc.addPage([vp.width, vp.height]);
-    newPage.drawImage(jpgImage, { x: 0, y: 0, width: vp.width, height: vp.height });
-  }
-
-  setProgress(95, 'Saving compressed PDF...');
-  await sleep(50);
-  const bytes = await newDoc.save({ useObjectStreams: true });
+  const pdfJs = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer.slice(0)) }).promise;
+  const bytes = await renderPagesToNewPDF(pdfJs, scale, jpegQ);
   setProgress(100, 'Done!');
   await sleep(100);
   return bytes;

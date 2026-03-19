@@ -1,5 +1,5 @@
 // ── Service Worker for PDF Tool PWA ──────────────────────────────────────────
-const CACHE = 'pdf-tool-v2';
+const CACHE = 'pdf-tool-v3';
 
 // Core assets to cache on install
 const PRECACHE = [
