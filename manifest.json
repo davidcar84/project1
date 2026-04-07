@@ -1,12 +1,13 @@
 {
-  "name": "PDF Tool",
-  "short_name": "PDF Tool",
-  "description": "Unlock, shrink, and watermark PDF files — all in your browser",
+  "name": "Workout Tracker",
+  "short_name": "Workouts",
+  "description": "Lightweight strength training tracker — log sets, track progress, sync across devices.",
   "start_url": "./",
+  "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#f9fafb",
-  "theme_color": "#2563eb",
+  "background_color": "#0f172a",
+  "theme_color": "#10b981",
   "icons": [
     {
       "src": "icons/icon-192.png",
@@ -21,6 +22,5 @@
       "purpose": "any maskable"
     }
   ],
-  "categories": ["utilities", "productivity"],
-  "screenshots": []
+  "categories": ["health", "fitness", "lifestyle"]
 }

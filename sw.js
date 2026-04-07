@@ -1,63 +1,54 @@
-// ── Service Worker for PDF Tool PWA ──────────────────────────────────────────
-const CACHE = 'pdf-tool-v3';
-
-// Core assets to cache on install
-const PRECACHE = [
+const CACHE = 'workout-tracker-v1';
+const ASSETS = [
   './',
   './index.html',
   './css/style.css',
   './js/app.js',
+  './js/firebase-config.js',
+  './js/seed-exercises.js',
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
 ];
 
-// Install: cache core assets
-self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(PRECACHE))
-  );
-  self.skipWaiting();
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
 });
 
-// Activate: remove old caches
-self.addEventListener('activate', (event) => {
-  event.waitUntil(
+self.addEventListener('activate', (e) => {
+  e.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
-    )
+      Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
+    ).then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
-// Fetch: cache-first for local assets, network-first for CDN libs
-self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
-
-  // CDN resources (pdf-lib, pdf.js) — network-first, fallback to cache
-  if (url.origin === 'https://cdnjs.cloudflare.com') {
-    event.respondWith(
-      fetch(event.request)
-        .then((res) => {
-          const clone = res.clone();
-          caches.open(CACHE).then((c) => c.put(event.request, clone));
-          return res;
-        })
-        .catch(() => caches.match(event.request))
-    );
+self.addEventListener('fetch', (e) => {
+  const url = new URL(e.request.url);
+  // Let Firebase SDK handle its own requests (and offline).
+  if (
+    url.hostname.includes('googleapis.com') ||
+    url.hostname.includes('gstatic.com') ||
+    url.hostname.includes('firebaseio.com') ||
+    url.hostname.includes('firebaseapp.com')
+  ) {
     return;
   }
-
-  // Local assets — cache-first
-  if (url.origin === self.location.origin) {
-    event.respondWith(
-      caches.match(event.request).then((cached) =>
-        cached || fetch(event.request).then((res) => {
-          const clone = res.clone();
-          caches.open(CACHE).then((c) => c.put(event.request, clone));
-          return res;
-        })
-      )
-    );
-  }
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    caches.match(e.request).then((cached) => {
+      return (
+        cached ||
+        fetch(e.request)
+          .then((res) => {
+            if (res.ok && url.origin === location.origin) {
+              const copy = res.clone();
+              caches.open(CACHE).then((c) => c.put(e.request, copy));
+            }
+            return res;
+          })
+          .catch(() => caches.match('./index.html'))
+      );
+    })
+  );
 });

@@ -1,458 +1,543 @@
-'use strict';
+// Workout Tracker — Firebase Auth + Firestore, hash-routed SPA.
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import {
+  getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged
+} from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
+import {
+  initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  collection, doc, getDocs, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
+  query, orderBy, serverTimestamp, writeBatch, where
+} from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
-// ── PDF.js worker ─────────────────────────────────────────────────────────────
-if (typeof pdfjsLib !== 'undefined') {
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-}
+import { firebaseConfig } from './firebase-config.js';
+import { DEFAULT_EXERCISES } from './seed-exercises.js';
 
-// ── State ─────────────────────────────────────────────────────────────────────
-let currentFile = null;
-let resultBlob  = null;
-let resultName  = '';
-let deferredInstallPrompt = null;
+const app = initializeApp(firebaseConfig);
+const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+});
+const auth = getAuth(app);
+const provider = new GoogleAuthProvider();
 
-// ── PWA Install Prompt ────────────────────────────────────────────────────────
+// ── State ───────────────────────────────────────────────────
+const state = {
+  user: null,
+  exercises: [],   // cached exercise library
+  unit: localStorage.getItem('unit') || 'kg',
+};
+
+const mainView = document.getElementById('mainView');
+const bottomNav = document.getElementById('bottomNav');
+const signOutBtn = document.getElementById('signOutBtn');
+const installBtn = document.getElementById('installBtn');
+
+// ── PWA install prompt ──────────────────────────────────────
+let deferredPrompt = null;
 window.addEventListener('beforeinstallprompt', (e) => {
   e.preventDefault();
-  deferredInstallPrompt = e;
-  document.getElementById('installBtn').hidden = false;
+  deferredPrompt = e;
+  installBtn.hidden = false;
+});
+installBtn.addEventListener('click', async () => {
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt();
+  await deferredPrompt.userChoice;
+  deferredPrompt = null;
+  installBtn.hidden = true;
 });
 
-document.getElementById('installBtn').addEventListener('click', async () => {
-  if (!deferredInstallPrompt) return;
-  deferredInstallPrompt.prompt();
-  const { outcome } = await deferredInstallPrompt.userChoice;
-  if (outcome === 'accepted') document.getElementById('installBtn').hidden = true;
-  deferredInstallPrompt = null;
-});
+// ── Auth ────────────────────────────────────────────────────
+signOutBtn.addEventListener('click', () => signOut(auth));
 
-// ── Service Worker ────────────────────────────────────────────────────────────
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
-}
-
-// ── DOM refs ──────────────────────────────────────────────────────────────────
-const dropZone      = document.getElementById('dropZone');
-const fileInput     = document.getElementById('fileInput');
-const fileInfo      = document.getElementById('fileInfo');
-const fileNameEl    = document.getElementById('fileName');
-const fileSizeEl    = document.getElementById('fileSize');
-const clearFileBtn  = document.getElementById('clearFile');
-const actionCards   = document.getElementById('actionCards');
-const loadingOverlay = document.getElementById('loadingOverlay');
-const loadingMsg    = document.getElementById('loadingMsg');
-const progressBar   = document.getElementById('progressBar');
-const progressLabel = document.getElementById('progressLabel');
-const resultBanner  = document.getElementById('resultBanner');
-const resultMsg     = document.getElementById('resultMsg');
-const downloadBtn   = document.getElementById('downloadBtn');
-
-// Panels
-const panelUnlock    = document.getElementById('panelUnlock');
-const panelShrink    = document.getElementById('panelShrink');
-const panelWatermark = document.getElementById('panelWatermark');
-
-// ── File Drop / Select ────────────────────────────────────────────────────────
-dropZone.addEventListener('click', () => fileInput.click());
-
-dropZone.addEventListener('dragover', (e) => {
-  e.preventDefault();
-  dropZone.classList.add('drag-over');
-});
-
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-
-dropZone.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dropZone.classList.remove('drag-over');
-  const file = e.dataTransfer.files[0];
-  if (file) loadFile(file);
-});
-
-fileInput.addEventListener('change', () => {
-  if (fileInput.files[0]) loadFile(fileInput.files[0]);
-});
-
-function loadFile(file) {
-  if (!file.name.toLowerCase().endsWith('.pdf')) {
-    alert('Please select a PDF file.');
+onAuthStateChanged(auth, async (user) => {
+  state.user = user;
+  if (!user) {
+    bottomNav.hidden = true;
+    signOutBtn.hidden = true;
+    renderSignIn();
     return;
   }
-  currentFile = file;
-  resultBlob  = null;
-  fileNameEl.textContent = file.name;
-  fileSizeEl.textContent = formatSize(file.size);
-  fileInfo.hidden    = false;
-  actionCards.hidden = false;
-  resultBanner.hidden = true;
-  hideAllPanels();
-}
-
-clearFileBtn.addEventListener('click', () => {
-  currentFile = null;
-  resultBlob  = null;
-  fileInput.value = '';
-  fileInfo.hidden     = true;
-  actionCards.hidden  = true;
-  resultBanner.hidden = true;
-  hideAllPanels();
+  signOutBtn.hidden = false;
+  bottomNav.hidden = false;
+  await ensureUserSeeded();
+  await loadExercises();
+  route();
 });
 
-// ── Action Card Clicks ────────────────────────────────────────────────────────
-document.querySelectorAll('.card[data-action]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    const action = btn.dataset.action;
-    hideAllPanels();
-    resultBanner.hidden = true;
-    if (action === 'unlock')    { panelUnlock.hidden = false; }
-    if (action === 'shrink')    { panelShrink.hidden = false; }
-    if (action === 'watermark') { panelWatermark.hidden = false; }
-    actionCards.hidden = true;
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  });
-});
-
-// Back buttons
-document.querySelectorAll('[data-back]').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    hideAllPanels();
-    actionCards.hidden = false;
-    resultBanner.hidden = true;
-  });
-});
-
-function hideAllPanels() {
-  panelUnlock.hidden    = true;
-  panelShrink.hidden    = true;
-  panelWatermark.hidden = true;
-}
-
-// ── Password toggle ───────────────────────────────────────────────────────────
-const pdfPasswordInput = document.getElementById('pdfPassword');
-document.getElementById('togglePw').addEventListener('click', () => {
-  const isText = pdfPasswordInput.type === 'text';
-  pdfPasswordInput.type = isText ? 'password' : 'text';
-});
-
-// ── Watermark preview & char counter ─────────────────────────────────────────
-const watermarkTextEl = document.getElementById('watermarkText');
-const charCountEl     = document.getElementById('charCount');
-const previewTextEl   = document.getElementById('previewText');
-
-watermarkTextEl.addEventListener('input', () => {
-  const val = watermarkTextEl.value;
-  charCountEl.textContent = val.length;
-  previewTextEl.textContent = val || 'Preview';
-});
-
-// ── === UNLOCK === ────────────────────────────────────────────────────────────
-document.getElementById('btnDoUnlock').addEventListener('click', async () => {
-  if (!currentFile) return;
-  const password = pdfPasswordInput.value;
-  if (!password.trim()) {
-    showError('unlockError', 'Please enter the PDF password.');
-    return;
+async function ensureUserSeeded() {
+  const uref = doc(db, 'users', state.user.uid);
+  const snap = await getDoc(uref);
+  if (!snap.exists()) {
+    await setDoc(uref, {
+      displayName: state.user.displayName || '',
+      createdAt: serverTimestamp(),
+    });
+    // Seed default exercises.
+    const batch = writeBatch(db);
+    const exCol = collection(db, 'users', state.user.uid, 'exercises');
+    for (const ex of DEFAULT_EXERCISES) {
+      batch.set(doc(exCol), { ...ex, isCustom: false });
+    }
+    await batch.commit();
   }
-  hideError('unlockError');
+}
 
-  const arrayBuffer = await readFileAsArrayBuffer(currentFile);
-  showLoading('Verifying password...', 10);
+async function loadExercises() {
+  const snap = await getDocs(collection(db, 'users', state.user.uid, 'exercises'));
+  state.exercises = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
 
-  try {
-    // Step 1 — use PDF.js to open the PDF (supports RC4, AES-128, AES-256)
-    let pdfJs;
-    try {
-      pdfJs = await pdfjsLib.getDocument({
-        data: new Uint8Array(arrayBuffer.slice(0)),
-        password,
-      }).promise;
-    } catch (e) {
-      hideLoading();
-      // PDF.js throws PasswordException for wrong / missing password
-      const isWrongPw = e.name === 'PasswordException' ||
-        (e.message || '').toLowerCase().includes('password');
-      showError('unlockError', isWrongPw
-        ? 'Incorrect password. Please try again.'
-        : `Could not open PDF: ${e.message}`);
+// ── Router ──────────────────────────────────────────────────
+window.addEventListener('hashchange', route);
+
+function route() {
+  if (!state.user) return;
+  const hash = location.hash || '#/';
+  const [path, ...rest] = hash.slice(2).split('/');
+  updateNav(path || 'home');
+  if (!path) return renderHome();
+  if (path === 'workout') return renderWorkout(rest[0]);
+  if (path === 'library') return renderLibrary();
+  if (path === 'exercise') return renderExerciseDetail(rest[0]);
+  if (path === 'settings') return renderSettings();
+  renderHome();
+}
+
+function updateNav(key) {
+  document.querySelectorAll('.bottom-nav a').forEach((a) => {
+    a.classList.toggle('active', a.dataset.nav === key ||
+      (key === '' && a.dataset.nav === 'home'));
+  });
+}
+
+// ── Helpers ─────────────────────────────────────────────────
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') e.className = v;
+    else if (k === 'html') e.innerHTML = v;
+    else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
+    else if (v === true) e.setAttribute(k, '');
+    else if (v !== false && v != null) e.setAttribute(k, v);
+  }
+  for (const c of children.flat()) {
+    if (c == null || c === false) continue;
+    e.append(c.nodeType ? c : document.createTextNode(c));
+  }
+  return e;
+}
+function clear() { mainView.innerHTML = ''; }
+function toast(msg) {
+  const t = el('div', { class: 'toast' }, msg);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 1800);
+}
+function fmtDate(d) {
+  if (!d) return '';
+  const dt = d.toDate ? d.toDate() : new Date(d);
+  return dt.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+}
+const userCol = (...p) => collection(db, 'users', state.user.uid, ...p);
+const userDoc = (...p) => doc(db, 'users', state.user.uid, ...p);
+
+// ── Views ───────────────────────────────────────────────────
+function renderSignIn() {
+  clear();
+  mainView.append(
+    el('div', { class: 'signin-card' },
+      el('h1', {}, 'Track your lifts 💪'),
+      el('p', {}, 'Log sets, watch your numbers climb. Synced across devices.'),
+      el('button', {
+        class: 'btn',
+        onclick: () => signInWithPopup(auth, provider).catch((e) => toast(e.message)),
+      }, 'Sign in with Google')
+    )
+  );
+}
+
+async function renderHome() {
+  clear();
+  mainView.append(el('div', { class: 'view-header' }, el('h1', {}, 'Workouts')));
+  const list = el('div', { class: 'list' });
+  mainView.append(list);
+
+  const q = query(userCol('workouts'), orderBy('date', 'desc'));
+  const snap = await getDocs(q);
+  if (snap.empty) {
+    list.append(el('div', { class: 'empty' }, 'No workouts yet. Tap + to start one.'));
+  } else {
+    snap.forEach((docSnap) => {
+      const w = docSnap.data();
+      list.append(
+        el('a', { class: 'card', href: `#/workout/${docSnap.id}` },
+          el('div', { class: 'title' }, fmtDate(w.date)),
+          el('div', { class: 'meta' },
+            `${w.exerciseCount || 0} exercises · ${w.setCount || 0} sets` +
+            (w.notes ? ` · ${w.notes}` : ''))
+        )
+      );
+    });
+  }
+
+  const fab = el('button', {
+    class: 'fab', title: 'New workout',
+    onclick: async () => {
+      const ref = await addDoc(userCol('workouts'), {
+        date: serverTimestamp(),
+        notes: '',
+        exerciseCount: 0,
+        setCount: 0,
+      });
+      location.hash = `#/workout/${ref.id}`;
+    },
+  }, '+');
+  mainView.append(fab);
+}
+
+async function renderWorkout(workoutId) {
+  clear();
+  if (!workoutId) { location.hash = '#/'; return; }
+  const wref = userDoc('workouts', workoutId);
+  const wsnap = await getDoc(wref);
+  if (!wsnap.exists()) { location.hash = '#/'; return; }
+  const workout = wsnap.data();
+
+  const setsSnap = await getDocs(query(userCol('workouts', workoutId, 'sets'), orderBy('order')));
+  const sets = setsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+  // Group sets by exerciseId in insertion order.
+  const groups = [];
+  const byEx = new Map();
+  for (const s of sets) {
+    if (!byEx.has(s.exerciseId)) {
+      const g = { exerciseId: s.exerciseId, exerciseName: s.exerciseName, sets: [] };
+      byEx.set(s.exerciseId, g); groups.push(g);
+    }
+    byEx.get(s.exerciseId).sets.push(s);
+  }
+
+  mainView.append(
+    el('div', { class: 'view-header' },
+      el('a', { class: 'back', href: '#/' }, '← Back'),
+      el('h1', {}, fmtDate(workout.date) || 'Workout'),
+      el('button', {
+        class: 'btn-ghost', onclick: async () => {
+          if (!confirm('Delete this workout?')) return;
+          const batch = writeBatch(db);
+          setsSnap.forEach((s) => batch.delete(s.ref));
+          batch.delete(wref);
+          await batch.commit();
+          location.hash = '#/';
+        }
+      }, '🗑')
+    )
+  );
+
+  const notesInput = el('textarea', {
+    rows: 2, placeholder: 'Notes (optional)',
+    onchange: (e) => updateDoc(wref, { notes: e.target.value }),
+  });
+  notesInput.value = workout.notes || '';
+  mainView.append(el('div', { class: 'form-row' }, notesInput));
+
+  const container = el('div');
+  mainView.append(container);
+
+  function renderBlock(group) {
+    const block = el('div', { class: 'exercise-block' });
+    block.append(
+      el('h3', {},
+        el('span', {}, group.exerciseName),
+        el('button', {
+          class: 'remove', title: 'Remove exercise',
+          onclick: async () => {
+            if (!confirm(`Remove ${group.exerciseName}?`)) return;
+            const batch = writeBatch(db);
+            for (const s of group.sets) batch.delete(userDoc('workouts', workoutId, 'sets', s.id));
+            await batch.commit();
+            await recomputeCounts();
+            reloadSets();
+          }
+        }, '×')
+      )
+    );
+
+    group.sets.forEach((s, idx) => {
+      const row = el('div', { class: 'set-row' },
+        el('div', { class: 'idx' }, String(idx + 1)),
+        el('input', {
+          type: 'number', inputmode: 'decimal', placeholder: 'Reps', value: s.reps ?? '',
+          onchange: (e) => updateDoc(userDoc('workouts', workoutId, 'sets', s.id),
+            { reps: Number(e.target.value) || 0 }),
+        }),
+        el('input', {
+          type: 'number', inputmode: 'decimal', step: '0.5',
+          placeholder: `Weight (${state.unit})`, value: s.weightKg ?? '',
+          onchange: (e) => updateDoc(userDoc('workouts', workoutId, 'sets', s.id),
+            { weightKg: Number(e.target.value) || 0 }),
+        }),
+        el('button', {
+          class: 'del', title: 'Delete set', onclick: async () => {
+            await deleteDoc(userDoc('workouts', workoutId, 'sets', s.id));
+            await recomputeCounts();
+            reloadSets();
+          }
+        }, '×')
+      );
+      block.append(row);
+    });
+
+    block.append(
+      el('button', {
+        class: 'add-set',
+        onclick: async () => {
+          const last = group.sets[group.sets.length - 1];
+          await addDoc(userCol('workouts', workoutId, 'sets'), {
+            exerciseId: group.exerciseId,
+            exerciseName: group.exerciseName,
+            reps: last?.reps || 0,
+            weightKg: last?.weightKg || 0,
+            order: Date.now(),
+          });
+          await recomputeCounts();
+          reloadSets();
+        },
+      }, '+ Add set')
+    );
+    return block;
+  }
+
+  function redraw() {
+    container.innerHTML = '';
+    groups.forEach((g) => container.append(renderBlock(g)));
+    container.append(
+      el('button', {
+        class: 'btn btn-secondary', style: 'margin-top: 8px;',
+        onclick: () => openExercisePicker(async (ex) => {
+          await addDoc(userCol('workouts', workoutId, 'sets'), {
+            exerciseId: ex.id,
+            exerciseName: ex.name,
+            reps: 0,
+            weightKg: 0,
+            order: Date.now(),
+          });
+          await recomputeCounts();
+          reloadSets();
+        }),
+      }, '+ Add exercise')
+    );
+  }
+
+  async function reloadSets() { await renderWorkout(workoutId); }
+  async function recomputeCounts() {
+    const snap = await getDocs(userCol('workouts', workoutId, 'sets'));
+    const exIds = new Set();
+    snap.forEach((d) => exIds.add(d.data().exerciseId));
+    await updateDoc(wref, { setCount: snap.size, exerciseCount: exIds.size });
+  }
+
+  redraw();
+}
+
+function openExercisePicker(onPick) {
+  const backdrop = el('div', { class: 'modal-backdrop', onclick: (e) => {
+    if (e.target === backdrop) backdrop.remove();
+  }});
+  const modal = el('div', { class: 'modal' });
+  modal.append(
+    el('button', { class: 'close', onclick: () => backdrop.remove() }, '×'),
+    el('h2', {}, 'Pick an exercise')
+  );
+  const search = el('input', { class: 'search-box', placeholder: 'Search…', type: 'search' });
+  modal.append(search);
+  const list = el('div', { class: 'list' });
+  modal.append(list);
+
+  function refresh() {
+    const q = search.value.trim().toLowerCase();
+    list.innerHTML = '';
+    state.exercises
+      .filter((e) => !q || e.name.toLowerCase().includes(q) ||
+        (e.muscleGroup || '').toLowerCase().includes(q))
+      .forEach((ex) => {
+        list.append(
+          el('button', {
+            class: 'card', onclick: () => { backdrop.remove(); onPick(ex); },
+          },
+            el('div', { class: 'title' }, ex.name),
+            el('div', { class: 'muscle-tag' }, ex.muscleGroup || '—'))
+        );
+      });
+  }
+  search.addEventListener('input', refresh);
+  refresh();
+  backdrop.append(modal);
+  document.body.append(backdrop);
+  search.focus();
+}
+
+async function renderLibrary() {
+  clear();
+  mainView.append(
+    el('div', { class: 'view-header' },
+      el('h1', {}, 'Exercises'),
+      el('button', {
+        class: 'btn-ghost', onclick: async () => {
+          const name = prompt('Exercise name?');
+          if (!name) return;
+          const muscleGroup = prompt('Muscle group? (optional)') || '';
+          await addDoc(userCol('exercises'), { name, muscleGroup, isCustom: true });
+          await loadExercises();
+          renderLibrary();
+        }
+      }, '+ New')
+    )
+  );
+
+  const search = el('input', { class: 'search-box', type: 'search', placeholder: 'Search exercises…' });
+  mainView.append(search);
+  const list = el('div', { class: 'list' });
+  mainView.append(list);
+
+  function refresh() {
+    const q = search.value.trim().toLowerCase();
+    list.innerHTML = '';
+    const filtered = state.exercises.filter((e) =>
+      !q || e.name.toLowerCase().includes(q) || (e.muscleGroup || '').toLowerCase().includes(q));
+    if (filtered.length === 0) {
+      list.append(el('div', { class: 'empty' }, 'No exercises found.'));
       return;
     }
-
-    setProgress(30, 'Password verified — rebuilding PDF...');
-
-    // Step 2 — render all pages to canvas via PDF.js, then pack into a new
-    // pdf-lib document.  This approach works for every encryption type because
-    // we never ask pdf-lib to decrypt; we give it already-rendered pixels.
-    const bytes = await renderPagesToNewPDF(pdfJs, 2.0, 0.94);
-
-    setProgress(100, 'Done!');
-    await sleep(100);
-
-    const baseName = stripExtension(currentFile.name);
-    finishWithBlob(
-      new Blob([bytes], { type: 'application/pdf' }),
-      `${baseName}_unlocked.pdf`,
-      'PDF unlocked — downloaded without password protection.'
-    );
-  } catch (err) {
-    hideLoading();
-    showError('unlockError', `Failed to unlock: ${err.message}`);
+    filtered.forEach((ex) => {
+      list.append(
+        el('a', { class: 'card', href: `#/exercise/${ex.id}` },
+          el('div', { class: 'title' }, ex.name),
+          el('div', { class: 'muscle-tag' }, ex.muscleGroup || '—'))
+      );
+    });
   }
-});
-
-// ── === SHRINK === ────────────────────────────────────────────────────────────
-document.getElementById('btnDoShrink').addEventListener('click', async () => {
-  if (!currentFile) return;
-  hideError('shrinkError');
-
-  const quality = document.querySelector('input[name="quality"]:checked')?.value || 'medium';
-  const arrayBuffer = await readFileAsArrayBuffer(currentFile);
-
-  showLoading('Preparing compression...', 0);
-
-  try {
-    const compressedBytes = await compressPDF(arrayBuffer, quality);
-    const baseName = stripExtension(currentFile.name);
-    const origSize = currentFile.size;
-    const newSize  = compressedBytes.byteLength;
-    const savings  = Math.round((1 - newSize / origSize) * 100);
-    const savingsStr = savings > 0 ? ` (${savings}% smaller)` : ' (size similar to original)';
-
-    finishWithBlob(
-      new Blob([compressedBytes], { type: 'application/pdf' }),
-      `${baseName}_compressed.pdf`,
-      `Compressed with ${quality} quality${savingsStr}.`
-    );
-  } catch (err) {
-    hideLoading();
-    showError('shrinkError', `Compression failed: ${err.message}`);
-  }
-});
-
-// ── Shared renderer: PDF.js → canvas → pdf-lib ───────────────────────────────
-// pdfJs   : already-loaded pdfjsLib document
-// scale   : render scale (1.0 = 72 dpi, 2.0 = 144 dpi)
-// jpegQ   : JPEG quality 0..1
-async function renderPagesToNewPDF(pdfJs, scale, jpegQ) {
-  const numPages = pdfJs.numPages;
-  const newDoc   = await PDFLib.PDFDocument.create();
-
-  for (let i = 1; i <= numPages; i++) {
-    setProgress(Math.round(10 + (i / numPages) * 80), `Page ${i} of ${numPages}...`);
-    await sleep(0); // yield to browser so spinner stays responsive
-
-    const page   = await pdfJs.getPage(i);
-    const vp     = page.getViewport({ scale });
-    const canvas = document.createElement('canvas');
-    canvas.width  = Math.round(vp.width);
-    canvas.height = Math.round(vp.height);
-    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-
-    const dataUrl  = canvas.toDataURL('image/jpeg', jpegQ);
-    const imgBytes = Uint8Array.from(atob(dataUrl.split(',')[1]), c => c.charCodeAt(0));
-    const jpg      = await newDoc.embedJpg(imgBytes);
-
-    // Add page at the original (1×) dimensions so physical size is preserved
-    const vp1  = page.getViewport({ scale: 1.0 });
-    const np   = newDoc.addPage([vp1.width, vp1.height]);
-    np.drawImage(jpg, { x: 0, y: 0, width: vp1.width, height: vp1.height });
-  }
-
-  setProgress(95, 'Saving...');
-  await sleep(30);
-  return newDoc.save({ useObjectStreams: true });
+  search.addEventListener('input', refresh);
+  refresh();
 }
 
-async function compressPDF(arrayBuffer, quality) {
-  const qualityMap = {
-    low:    { scale: 0.8,  jpegQ: 0.35 },
-    medium: { scale: 1.0,  jpegQ: 0.65 },
-    high:   { scale: 1.5,  jpegQ: 0.85 },
-  };
-  const { scale, jpegQ } = qualityMap[quality];
+async function renderExerciseDetail(exerciseId) {
+  clear();
+  const ex = state.exercises.find((e) => e.id === exerciseId);
+  if (!ex) { location.hash = '#/library'; return; }
 
-  const pdfJs = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer.slice(0)) }).promise;
-  const bytes = await renderPagesToNewPDF(pdfJs, scale, jpegQ);
-  setProgress(100, 'Done!');
-  await sleep(100);
-  return bytes;
-}
+  mainView.append(
+    el('div', { class: 'view-header' },
+      el('a', { class: 'back', href: '#/library' }, '← Back'),
+      el('h1', {}, ex.name),
+      ex.isCustom
+        ? el('button', { class: 'btn-ghost', onclick: async () => {
+            if (!confirm('Delete this exercise?')) return;
+            await deleteDoc(userDoc('exercises', ex.id));
+            await loadExercises();
+            location.hash = '#/library';
+          } }, '🗑')
+        : el('span')
+    )
+  );
 
-// ── === WATERMARK === ─────────────────────────────────────────────────────────
-document.getElementById('btnDoWatermark').addEventListener('click', async () => {
-  if (!currentFile) return;
-  hideError('watermarkError');
+  // Collect all sets for this exercise across workouts.
+  // Query via collectionGroup would be ideal but requires index; iterate workouts instead (lightweight for v1).
+  const wsnap = await getDocs(query(userCol('workouts'), orderBy('date', 'desc')));
+  const history = []; // {date, topWeight, volume, sets:[{reps,weightKg}]}
+  for (const wdoc of wsnap.docs) {
+    const w = wdoc.data();
+    const setsSnap = await getDocs(
+      query(userCol('workouts', wdoc.id, 'sets'), where('exerciseId', '==', exerciseId))
+    );
+    if (setsSnap.empty) continue;
+    const setsArr = setsSnap.docs.map((d) => d.data());
+    const topWeight = Math.max(...setsArr.map((s) => s.weightKg || 0));
+    const volume = setsArr.reduce((a, s) => a + (s.reps || 0) * (s.weightKg || 0), 0);
+    history.push({ date: w.date, topWeight, volume, sets: setsArr });
+  }
 
-  const text = watermarkTextEl.value.trim();
-  if (!text) {
-    showError('watermarkError', 'Please enter the watermark text.');
+  if (history.length === 0) {
+    mainView.append(el('div', { class: 'empty' }, 'No history yet for this exercise.'));
     return;
   }
 
-  const arrayBuffer = await readFileAsArrayBuffer(currentFile);
-  showLoading('Adding watermark...', 0);
+  // Chart: top weight over time.
+  const chronological = [...history].reverse();
+  mainView.append(renderChart('Top set weight', chronological.map((h) => ({
+    x: h.date?.toDate?.() || new Date(), y: h.topWeight,
+  })), state.unit));
 
-  try {
-    const bytes = await addWatermark(arrayBuffer, text);
-    const baseName = stripExtension(currentFile.name);
-    finishWithBlob(
-      new Blob([bytes], { type: 'application/pdf' }),
-      `${baseName}_watermarked.pdf`,
-      'Watermark added to all pages successfully.'
-    );
-  } catch (err) {
-    hideLoading();
-    showError('watermarkError', `Failed to add watermark: ${err.message}`);
-  }
-});
-
-async function addWatermark(arrayBuffer, text) {
-  const pdfDoc = await PDFLib.PDFDocument.load(arrayBuffer);
-  const pages  = pdfDoc.getPages();
-  const font   = await pdfDoc.embedFont(PDFLib.StandardFonts.HelveticaBold);
-  const angleRad = (30 * Math.PI) / 180; // 30 degrees in radians
-
-  for (let i = 0; i < pages.length; i++) {
-    setProgress(Math.round(((i + 1) / pages.length) * 90), `Processing page ${i + 1} of ${pages.length}...`);
-    await sleep(0);
-
-    const page   = pages[i];
-    const { width, height } = page.getSize();
-
-    // Choose font size to fit text across ~60% of the page diagonal
-    const diag = Math.sqrt(width * width + height * height);
-    const lines = text.split('\n');
-    const maxLine = lines.reduce((a, b) => a.length > b.length ? a : b, '');
-
-    let fontSize = Math.max(20, Math.min(80, (diag * 0.55) / Math.max(maxLine.length * 0.55, 1)));
-    // Verify it fits and scale down if needed
-    while (font.widthOfTextAtSize(maxLine, fontSize) > diag * 0.7 && fontSize > 14) {
-      fontSize -= 2;
-    }
-
-    const lineHeight = fontSize * 1.3;
-    const totalH = lineHeight * lines.length;
-
-    // Center of the page
-    const cx = width  / 2;
-    const cy = height / 2;
-
-    for (let li = 0; li < lines.length; li++) {
-      const lineText = lines[li];
-      const lineW    = font.widthOfTextAtSize(lineText, fontSize);
-
-      // Vertical offset for multi-line: center the block
-      const yOffset = ((lines.length - 1) / 2 - li) * lineHeight;
-
-      // Position: origin of text so that the visual center lands at (cx, cy + yOffset).
-      // When rotating by angle θ around the origin, the center of the text box
-      // at (w/2, h/2) maps to (cx, cy). Solve for origin:
-      const halfW = lineW / 2;
-      const halfH = fontSize / 2;
-      const ox = cx - (halfW * Math.cos(angleRad) - halfH * Math.sin(angleRad));
-      const oy = (cy + yOffset) - (halfW * Math.sin(angleRad) + halfH * Math.cos(angleRad));
-
-      // Shadow pass — offset 2,−2, darker gray, low opacity
-      page.drawText(lineText, {
-        x: ox + 2,
-        y: oy - 2,
-        size: fontSize,
-        font,
-        color: PDFLib.rgb(0.3, 0.3, 0.3),
-        opacity: 0.08,
-        rotate: PDFLib.degrees(30),
-      });
-
-      // Main watermark — light gray, semi-transparent
-      page.drawText(lineText, {
-        x: ox,
-        y: oy,
-        size: fontSize,
-        font,
-        color: PDFLib.rgb(0.70, 0.70, 0.70),
-        opacity: 0.30,
-        rotate: PDFLib.degrees(30),
-      });
-    }
-  }
-
-  setProgress(96, 'Saving PDF...');
-  await sleep(50);
-  const bytes = await pdfDoc.save({ useObjectStreams: false });
-  setProgress(100, 'Done!');
-  await sleep(100);
-  return bytes;
-}
-
-// ── Download ──────────────────────────────────────────────────────────────────
-downloadBtn.addEventListener('click', () => {
-  if (!resultBlob || !resultName) return;
-  const url = URL.createObjectURL(resultBlob);
-  const a   = document.createElement('a');
-  a.href     = url;
-  a.download = resultName;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-});
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function readFileAsArrayBuffer(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload  = (e) => resolve(e.target.result);
-    reader.onerror = reject;
-    reader.readAsArrayBuffer(file);
+  // History table.
+  const table = el('table', { class: 'history-table' },
+    el('thead', {}, el('tr', {},
+      el('th', {}, 'Date'),
+      el('th', {}, 'Top'),
+      el('th', {}, 'Volume'),
+      el('th', {}, 'Sets'))));
+  const tbody = el('tbody');
+  history.forEach((h) => {
+    tbody.append(el('tr', {},
+      el('td', {}, fmtDate(h.date)),
+      el('td', {}, `${h.topWeight} ${state.unit}`),
+      el('td', {}, `${Math.round(h.volume)} ${state.unit}`),
+      el('td', {}, String(h.sets.length))));
   });
+  table.append(tbody);
+  mainView.append(table);
 }
 
-function formatSize(bytes) {
-  if (bytes < 1024)       return `${bytes} B`;
-  if (bytes < 1024*1024)  return `${(bytes/1024).toFixed(1)} KB`;
-  return `${(bytes/1024/1024).toFixed(2)} MB`;
+function renderChart(title, points, unit) {
+  const wrap = el('div', { class: 'chart-wrap' });
+  wrap.append(el('h3', {}, `${title} (${unit})`));
+  const W = 600, H = 160, P = 28;
+  if (points.length === 0) return wrap;
+  const xs = points.map((p) => p.x.getTime());
+  const ys = points.map((p) => p.y);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs) || xMin + 1;
+  const yMin = Math.min(...ys, 0), yMax = Math.max(...ys) || 1;
+  const sx = (x) => P + ((x - xMin) / (xMax - xMin || 1)) * (W - 2 * P);
+  const sy = (y) => H - P - ((y - yMin) / (yMax - yMin || 1)) * (H - 2 * P);
+  const d = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x.getTime()).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+  const svg = `
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+      <line x1="${P}" y1="${H - P}" x2="${W - P}" y2="${H - P}" stroke="#334155" stroke-width="1"/>
+      <line x1="${P}" y1="${P}" x2="${P}" y2="${H - P}" stroke="#334155" stroke-width="1"/>
+      <path d="${d}" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+      ${points.map((p) => `<circle cx="${sx(p.x.getTime()).toFixed(1)}" cy="${sy(p.y).toFixed(1)}" r="3" fill="#10b981"/>`).join('')}
+      <text x="${P}" y="${P - 8}" fill="#94a3b8" font-size="11">${yMax}</text>
+      <text x="${P}" y="${H - P + 14}" fill="#94a3b8" font-size="11">${yMin}</text>
+    </svg>`;
+  const div = el('div', { html: svg });
+  wrap.append(div.firstElementChild);
+  return wrap;
 }
 
-function stripExtension(name) {
-  return name.replace(/\.pdf$/i, '');
-}
+function renderSettings() {
+  clear();
+  mainView.append(el('div', { class: 'view-header' }, el('h1', {}, 'Settings')));
 
-function showLoading(msg, pct) {
-  loadingMsg.textContent    = msg;
-  progressBar.style.width   = `${pct}%`;
-  progressLabel.textContent = '';
-  loadingOverlay.hidden     = false;
-}
+  const unitSelect = el('select', {
+    onchange: (e) => {
+      state.unit = e.target.value;
+      localStorage.setItem('unit', state.unit);
+      toast(`Units set to ${state.unit}`);
+    }
+  },
+    el('option', { value: 'kg' }, 'Kilograms (kg)'),
+    el('option', { value: 'lb' }, 'Pounds (lb)'));
+  unitSelect.value = state.unit;
+  mainView.append(el('div', { class: 'form-row' },
+    el('label', {}, 'Units'),
+    unitSelect));
 
-function setProgress(pct, label) {
-  progressBar.style.width   = `${pct}%`;
-  progressLabel.textContent = label || '';
-}
+  mainView.append(el('div', { class: 'form-row' },
+    el('label', {}, 'Account'),
+    el('div', { class: 'card' },
+      el('div', { class: 'title' }, state.user.displayName || 'Anonymous'),
+      el('div', { class: 'meta' }, state.user.email || ''))));
 
-function hideLoading() {
-  loadingOverlay.hidden = true;
-  progressBar.style.width = '0%';
-}
-
-function finishWithBlob(blob, filename, message) {
-  hideLoading();
-  resultBlob = blob;
-  resultName = filename;
-  resultMsg.textContent = message;
-  resultBanner.hidden   = false;
-  resultBanner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-}
-
-function showError(id, msg) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.textContent = msg;
-  el.hidden = false;
-}
-
-function hideError(id) {
-  const el = document.getElementById(id);
-  if (el) el.hidden = true;
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  mainView.append(
+    el('button', { class: 'btn btn-secondary', onclick: () => signOut(auth) }, 'Sign out')
+  );
 }
